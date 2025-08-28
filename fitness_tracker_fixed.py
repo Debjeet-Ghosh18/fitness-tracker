@@ -12,369 +12,405 @@ def parse_args():
                        help='Path to input video file')
     parser.add_argument('-o', '--output', type=str, default=None,
                        help='Path to output video file')
-    parser.add_argument('--det', type=float, default=0.5, 
+    parser.add_argument('--det', type=float, default=0.7, 
                        help='Detection confidence threshold (0.0-1.0)')
-    parser.add_argument('--track', type=float, default=0.5, 
+    parser.add_argument('--track', type=float, default=0.7, 
                        help='Tracking confidence threshold (0.0-1.0)')
     parser.add_argument('-c', '--complexity', type=int, default=1, 
                        help='Model complexity: 0=light, 1=full, 2=heavy')
-    parser.add_argument('-wt', '--workout_type', type=str, default='PushUp',
+    parser.add_argument('-wt', '--workout_type', type=str, default='General',
                        choices=['PushUp', 'Squat', 'General'],
                        help='Type of workout to track')
     parser.add_argument('--cam', action='store_true',
                        help='Use camera instead of video file')
+    parser.add_argument('--debug', action='store_true',
+                       help='Enable debug mode with detailed output')
     
     return parser.parse_args()
 
 
 def calculate_angle(a, b, c):
-    """Calculate angle between three points (a-b-c)"""
+    """Calculate angle between three points with validation"""
     try:
-        a = np.array(a)
-        b = np.array(b)
-        c = np.array(c)
+        a = np.array(a, dtype=np.float32)
+        b = np.array(b, dtype=np.float32)
+        c = np.array(c, dtype=np.float32)
 
-        radians = np.arctan2(c[1] - b[1], c[0] - b[0]) - np.arctan2(a[1] - b[1], a[0] - b[0])
-        angle = np.abs(radians * 180.0 / np.pi)
+        # Validate input points
+        if np.any(a == 0) and np.any(b == 0) and np.any(c == 0):
+            return 0
 
-        if angle > 180.0:
-            angle = 360 - angle
+        ba = a - b
+        bc = c - b
 
-        return angle
+        cosine_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc))
+        cosine_angle = np.clip(cosine_angle, -1.0, 1.0)
+        angle = np.arccos(cosine_angle)
+        
+        return np.degrees(angle)
     except Exception as e:
-        print(f"Error calculating angle: {e}")
+        if args.debug:
+            print(f"Angle calculation error: {e}")
         return 0
 
 
-def get_landmark_coords(landmarks, landmark_type, image_width, image_height):
-    """Extract landmark coordinates safely"""
+def get_landmark_coords(landmarks, landmark_idx, width, height):
+    """Extract landmark coordinates with better error handling"""
     try:
-        landmark = landmarks[landmark_type.value]
-        return [landmark.x * image_width, landmark.y * image_height]
-    except (AttributeError, IndexError):
+        if landmarks is None or len(landmarks) <= landmark_idx:
+            return [0, 0]
+            
+        landmark = landmarks[landmark_idx]
+        
+        # Check visibility threshold
+        if hasattr(landmark, 'visibility') and landmark.visibility < 0.5:
+            return [0, 0]
+            
+        x = int(landmark.x * width)
+        y = int(landmark.y * height)
+        
+        # Boundary check
+        if 0 <= x <= width and 0 <= y <= height:
+            return [x, y]
+        else:
+            return [0, 0]
+            
+    except Exception as e:
+        if args.debug:
+            print(f"Landmark extraction error: {e}")
         return [0, 0]
 
 
 class WorkoutTracker:
-    def __init__(self, workout_type='PushUp'):
+    def __init__(self, workout_type='General'):
         self.workout_type = workout_type
         self.reset_counters()
         
     def reset_counters(self):
-        """Reset all workout counters"""
+        """Reset all counters and states"""
         self.pushup_counter = 0
         self.squat_counter = 0
+        self.pushup_stage = 'up'  # 'up' or 'down'
+        self.squat_stage = 'up'   # 'up' or 'down'
         
-        # Push-up state tracking
-        self.pushup_up_pos = False
-        self.pushup_down_pos = False
+    def update_pushup_count(self, left_angle, right_angle):
+        """Update pushup counter based on arm angles"""
+        # Use the average angle for more stability
+        avg_angle = (left_angle + right_angle) / 2
         
-        # Squat state tracking
-        self.squat_up_pos = False
-        self.squat_down_pos = False
-        
-    def update_pushup_count(self, left_elbow_angle, right_elbow_angle):
-        """Update push-up counter based on elbow angles"""
-        # Use average of both arms for more reliable detection
-        avg_elbow_angle = (left_elbow_angle + right_elbow_angle) / 2
-        
-        # Up position: arms extended
-        if avg_elbow_angle > 160 and not self.pushup_up_pos:
-            self.pushup_up_pos = True
-            self.pushup_down_pos = False
-            
-        # Down position: arms bent
-        elif avg_elbow_angle < 90 and self.pushup_up_pos and not self.pushup_down_pos:
-            self.pushup_down_pos = True
-            
-        # Complete rep: back to up position
-        elif avg_elbow_angle > 160 and self.pushup_down_pos:
+        # Push-up detection logic
+        if avg_angle > 160:
+            self.pushup_stage = 'up'
+        elif avg_angle < 90 and self.pushup_stage == 'up':
+            self.pushup_stage = 'down'
             self.pushup_counter += 1
-            self.pushup_up_pos = True
-            self.pushup_down_pos = False
+            print(f"Push-up completed! Count: {self.pushup_counter}")
             
-    def update_squat_count(self, left_knee_angle, right_knee_angle):
+    def update_squat_count(self, left_angle, right_angle):
         """Update squat counter based on knee angles"""
-        # Use average of both knees for more reliable detection
-        avg_knee_angle = (left_knee_angle + right_knee_angle) / 2
+        # Use the average angle for more stability
+        avg_angle = (left_angle + right_angle) / 2
         
-        # Up position: legs extended
-        if avg_knee_angle > 160 and not self.squat_up_pos:
-            self.squat_up_pos = True
-            self.squat_down_pos = False
-            
-        # Down position: knees bent (squat)
-        elif avg_knee_angle < 120 and self.squat_up_pos and not self.squat_down_pos:
-            self.squat_down_pos = True
-            
-        # Complete rep: back to up position
-        elif avg_knee_angle > 160 and self.squat_down_pos:
+        # Squat detection logic
+        if avg_angle > 160:
+            self.squat_stage = 'up'
+        elif avg_angle < 90 and self.squat_stage == 'up':
+            self.squat_stage = 'down'
             self.squat_counter += 1
-            self.squat_up_pos = True
-            self.squat_down_pos = False
+            print(f"Squat completed! Count: {self.squat_counter}")
 
 
-def draw_custom_skeleton(image, landmarks, mp_pose, image_width, image_height, line_color):
-    """Draw custom skeleton with enhanced visibility"""
-    # Get key landmark coordinates
-    nose = get_landmark_coords(landmarks, mp_pose.PoseLandmark.NOSE, image_width, image_height)
-    left_shoulder = get_landmark_coords(landmarks, mp_pose.PoseLandmark.LEFT_SHOULDER, image_width, image_height)
-    right_shoulder = get_landmark_coords(landmarks, mp_pose.PoseLandmark.RIGHT_SHOULDER, image_width, image_height)
-    left_hip = get_landmark_coords(landmarks, mp_pose.PoseLandmark.LEFT_HIP, image_width, image_height)
-    right_hip = get_landmark_coords(landmarks, mp_pose.PoseLandmark.RIGHT_HIP, image_width, image_height)
-    
-    # Calculate midpoints
-    shoulder_mid = [(left_shoulder[0] + right_shoulder[0]) // 2, (left_shoulder[1] + right_shoulder[1]) // 2]
-    hip_mid = [(left_hip[0] + right_hip[0]) // 2, (left_hip[1] + right_hip[1]) // 2]
-    neck_point = [(nose[0] + shoulder_mid[0]) // 2, (nose[1] + shoulder_mid[1]) // 2]
-    torso_mid = [(shoulder_mid[0] + hip_mid[0]) // 2, (shoulder_mid[1] + hip_mid[1]) // 2]
-    
-    # Draw custom lines
-    cv2.line(image, tuple(map(int, left_shoulder)), tuple(map(int, neck_point)), line_color, 3)
-    cv2.line(image, tuple(map(int, right_shoulder)), tuple(map(int, neck_point)), line_color, 3)
-    cv2.line(image, tuple(map(int, neck_point)), tuple(map(int, torso_mid)), line_color, 3)
-    cv2.line(image, tuple(map(int, torso_mid)), tuple(map(int, left_hip)), line_color, 3)
-    cv2.line(image, tuple(map(int, torso_mid)), tuple(map(int, right_hip)), line_color, 3)
-    
-    # Draw key points
-    cv2.circle(image, tuple(map(int, neck_point)), 6, line_color, -1)
-    cv2.circle(image, tuple(map(int, left_shoulder)), 4, line_color, -1)
-    cv2.circle(image, tuple(map(int, right_shoulder)), 4, line_color, -1)
-    cv2.circle(image, tuple(map(int, torso_mid)), 6, line_color, -1)
+def draw_landmarks_and_connections(image, landmarks, mp_pose, mp_drawing):
+    """Draw pose landmarks and connections with better visibility"""
+    if landmarks:
+        # Custom drawing specs for better visibility
+        landmark_spec = mp_drawing.DrawingSpec(
+            color=(0, 255, 0), thickness=4, circle_radius=4)
+        connection_spec = mp_drawing.DrawingSpec(
+            color=(255, 255, 255), thickness=3)
+            
+        mp_drawing.draw_landmarks(
+            image, landmarks, mp_pose.POSE_CONNECTIONS,
+            landmark_spec, connection_spec)
 
 
-def draw_info_panel(image, angles, tracker, fps):
-    """Draw information panel with angles and counters"""
+def draw_angle_info(image, point, angle, label):
+    """Draw angle information at specific points"""
+    if point != [0, 0] and angle > 0:
+        angle_text = f'{int(angle)}'
+        cv2.putText(image, angle_text, tuple(point), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+
+
+def create_info_panel(image, angles, tracker, fps):
+    """Create information panel with workout stats"""
     height, width = image.shape[:2]
-    panel_width = 350
-    panel_height = 300
     
-    # Create semi-transparent panel
+    # Panel dimensions
+    panel_width = 300
+    panel_height = height
+    
+    # Create overlay
     overlay = image.copy()
-    cv2.rectangle(overlay, (width - panel_width, 0), (width, panel_height), (0, 0, 0), -1)
-    image = cv2.addWeighted(overlay, 0.7, image, 0.3, 0)
+    cv2.rectangle(overlay, (width - panel_width, 0), 
+                 (width, panel_height), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.7, image, 0.3, 0, image)
     
-    y_offset = 30
+    # Text properties
     font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 0.7
-    color = (0, 255, 255)
-    thickness = 2
+    small_font = cv2.FONT_HERSHEY_SIMPLEX
+    y = 40
     
     # Title
-    cv2.putText(image, 'Workout Tracker', (width - panel_width + 10, y_offset), 
-                cv2.FONT_HERSHEY_COMPLEX, 0.9, (255, 255, 255), 2)
-    y_offset += 40
+    cv2.putText(image, 'FITNESS TRACKER', (width - 290, y), 
+               font, 0.8, (255, 255, 255), 2)
+    y += 50
+    
+    # Workout type
+    cv2.putText(image, f'Mode: {tracker.workout_type}', (width - 290, y), 
+               small_font, 0.6, (0, 255, 255), 2)
+    y += 40
     
     # Angles
-    cv2.putText(image, f'L Elbow: {angles["left_elbow"]}°', 
-                (width - panel_width + 10, y_offset), font, font_scale, color, thickness)
-    y_offset += 30
-    cv2.putText(image, f'R Elbow: {angles["right_elbow"]}°', 
-                (width - panel_width + 10, y_offset), font, font_scale, color, thickness)
-    y_offset += 30
-    cv2.putText(image, f'L Knee: {angles["left_knee"]}°', 
-                (width - panel_width + 10, y_offset), font, font_scale, color, thickness)
-    y_offset += 30
-    cv2.putText(image, f'R Knee: {angles["right_knee"]}°', 
-                (width - panel_width + 10, y_offset), font, font_scale, color, thickness)
-    y_offset += 40
+    cv2.putText(image, 'JOINT ANGLES:', (width - 290, y), 
+               small_font, 0.6, (255, 200, 0), 2)
+    y += 30
     
-    # Counters
-    cv2.putText(image, f'Push-ups: {tracker.pushup_counter}', 
-                (width - panel_width + 10, y_offset), font, 0.8, (0, 255, 0), 2)
-    y_offset += 30
-    cv2.putText(image, f'Squats: {tracker.squat_counter}', 
-                (width - panel_width + 10, y_offset), font, 0.8, (0, 255, 0), 2)
-    y_offset += 30
+    angle_data = [
+        f'Left Elbow: {int(angles["left_elbow"])}°',
+        f'Right Elbow: {int(angles["right_elbow"])}°',
+        f'Left Knee: {int(angles["left_knee"])}°',
+        f'Right Knee: {int(angles["right_knee"])}°'
+    ]
     
-    # FPS
-    cv2.putText(image, f'FPS: {int(fps)}', 
-                (width - panel_width + 10, y_offset), font, font_scale, (255, 255, 255), thickness)
+    for angle_text in angle_data:
+        cv2.putText(image, angle_text, (width - 280, y), 
+                   small_font, 0.5, (255, 255, 255), 1)
+        y += 25
+    
+    y += 20
+    
+    # Exercise counters
+    cv2.putText(image, 'EXERCISE COUNT:', (width - 290, y), 
+               small_font, 0.6, (255, 200, 0), 2)
+    y += 30
+    
+    if tracker.workout_type in ['PushUp', 'General']:
+        cv2.putText(image, f'Push-ups: {tracker.pushup_counter}', 
+                   (width - 280, y), font, 0.7, (0, 255, 0), 2)
+        y += 35
+        cv2.putText(image, f'Stage: {tracker.pushup_stage}', 
+                   (width - 280, y), small_font, 0.5, (200, 200, 200), 1)
+        y += 25
+    
+    if tracker.workout_type in ['Squat', 'General']:
+        cv2.putText(image, f'Squats: {tracker.squat_counter}', 
+                   (width - 280, y), font, 0.7, (0, 255, 0), 2)
+        y += 35
+        cv2.putText(image, f'Stage: {tracker.squat_stage}', 
+                   (width - 280, y), small_font, 0.5, (200, 200, 200), 1)
+        y += 25
+    
+    # FPS and status
+    y = height - 60
+    cv2.putText(image, f'FPS: {int(fps)}', (width - 280, y), 
+               small_font, 0.6, (255, 255, 255), 2)
+    y += 25
+    cv2.putText(image, 'Press Q to quit, R to reset', (width - 290, y), 
+               small_font, 0.4, (200, 200, 200), 1)
 
 
 def main():
+    global args
     args = parse_args()
+    
+    print(f"Starting Fitness Tracker v2.0")
+    print(f"Workout Type: {args.workout_type}")
+    print(f"Detection Confidence: {args.det}")
+    print(f"Tracking Confidence: {args.track}")
+    print(f"Model Complexity: {args.complexity}")
+    print("-" * 40)
     
     # Initialize MediaPipe
     mp_drawing = mp.solutions.drawing_utils
     mp_pose = mp.solutions.pose
     
-    # Colors
-    line_color = (255, 255, 255)
-    
-    # Drawing specifications
-    drawing_spec = mp_drawing.DrawingSpec(thickness=2, circle_radius=2, color=line_color)
-    connection_spec = mp_drawing.DrawingSpec(thickness=2, color=line_color)
-    
-    # Initialize workout tracker
+    # Initialize tracker
     tracker = WorkoutTracker(args.workout_type)
     
-    # Initialize video capture
+    # Setup video capture
     if args.cam:
-        vid = cv2.VideoCapture(0)
+        cap = cv2.VideoCapture(0)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
     else:
-        vid = cv2.VideoCapture(args.video)
+        cap = cv2.VideoCapture(args.video)
     
-    if not vid.isOpened():
-        print(f"Error: Could not open {'camera' if args.cam else f'video file {args.video}'}")
+    if not cap.isOpened():
+        print(f"Error: Could not open {'camera' if args.cam else args.video}")
         return
     
-    # Get video properties
+    # Video properties
     if not args.cam:
-        width = int(vid.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(vid.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = int(vid.get(cv2.CAP_PROP_FPS))
-    else:
-        vid.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        vid.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        width, height, fps = 1280, 720, 30
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        print(f"Video FPS: {fps}, Total frames: {frame_count}")
     
-    # Initialize video writer
+    # Output video writer
     out = None
     if args.output:
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(args.output, fourcc, fps, (width, height))
+        fps_out = fps if not args.cam else 30
+        frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        out = cv2.VideoWriter(args.output, fourcc, fps_out, (frame_width, frame_height))
     
-    print(f"Starting fitness tracking - Workout type: {args.workout_type}")
-    print("Press 'q' or ESC to quit, 'r' to reset counters")
+    print("Starting pose detection...")
+    print("Controls: Q=quit, R=reset, SPACE=pause")
     
-    # Initialize pose detection
+    paused = False
+    frame_num = 0
+    
+    # Initialize pose estimation
     with mp_pose.Pose(
         min_detection_confidence=args.det,
         min_tracking_confidence=args.track,
         model_complexity=args.complexity,
-        smooth_landmarks=True) as pose:
+        smooth_landmarks=True,
+        enable_segmentation=False,
+        smooth_segmentation=True) as pose:
         
-        while vid.isOpened():
-            frame_start_time = time.time()
+        while cap.isOpened():
+            start_time = time.time()
             
-            success, image = vid.read()
-            if not success:
-                if args.cam:
-                    print("Failed to read from camera")
-                    continue
-                else:
-                    print("End of video")
+            if not paused:
+                ret, frame = cap.read()
+                if not ret:
+                    print("End of video or camera error")
                     break
+                
+                frame_num += 1
+                if args.debug and frame_num % 30 == 0:
+                    print(f"Processing frame {frame_num}")
             
-            # Get current frame dimensions
-            image_height, image_width, _ = image.shape
+            # Get frame dimensions
+            height, width, channels = frame.shape
             
-            # Convert BGR to RGB for MediaPipe
-            rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            rgb_image.flags.writeable = False
+            if not paused:
+                # Convert BGR to RGB
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                rgb_frame.flags.writeable = False
+                
+                # Process pose
+                results = pose.process(rgb_frame)
+                
+                # Convert back to BGR
+                rgb_frame.flags.writeable = True
             
-            # Process pose
-            results = pose.process(rgb_image)
+            # Initialize angles
+            angles = {
+                "left_elbow": 0,
+                "right_elbow": 0, 
+                "left_knee": 0,
+                "right_knee": 0
+            }
             
-            # Convert back to BGR
-            image.flags.writeable = True
-            
-            try:
-                if results.pose_landmarks:
-                    landmarks = results.pose_landmarks.landmark
-                    
-                    # Hide face landmarks for privacy
-                    face_landmarks = [
-                        mp_pose.PoseLandmark.LEFT_EYE, mp_pose.PoseLandmark.RIGHT_EYE,
-                        mp_pose.PoseLandmark.LEFT_EYE_INNER, mp_pose.PoseLandmark.RIGHT_EYE_INNER,
-                        mp_pose.PoseLandmark.LEFT_EYE_OUTER, mp_pose.PoseLandmark.RIGHT_EYE_OUTER,
-                        mp_pose.PoseLandmark.NOSE, mp_pose.PoseLandmark.MOUTH_LEFT,
-                        mp_pose.PoseLandmark.MOUTH_RIGHT, mp_pose.PoseLandmark.LEFT_EAR,
-                        mp_pose.PoseLandmark.RIGHT_EAR
-                    ]
-                    
-                    for landmark in face_landmarks:
-                        landmarks[landmark.value].visibility = 0
-                    
-                    # Get landmark coordinates
-                    left_shoulder = get_landmark_coords(landmarks, mp_pose.PoseLandmark.LEFT_SHOULDER, image_width, image_height)
-                    right_shoulder = get_landmark_coords(landmarks, mp_pose.PoseLandmark.RIGHT_SHOULDER, image_width, image_height)
-                    left_elbow = get_landmark_coords(landmarks, mp_pose.PoseLandmark.LEFT_ELBOW, image_width, image_height)
-                    right_elbow = get_landmark_coords(landmarks, mp_pose.PoseLandmark.RIGHT_ELBOW, image_width, image_height)
-                    left_wrist = get_landmark_coords(landmarks, mp_pose.PoseLandmark.LEFT_WRIST, image_width, image_height)
-                    right_wrist = get_landmark_coords(landmarks, mp_pose.PoseLandmark.RIGHT_WRIST, image_width, image_height)
-                    left_hip = get_landmark_coords(landmarks, mp_pose.PoseLandmark.LEFT_HIP, image_width, image_height)
-                    right_hip = get_landmark_coords(landmarks, mp_pose.PoseLandmark.RIGHT_HIP, image_width, image_height)
-                    left_knee = get_landmark_coords(landmarks, mp_pose.PoseLandmark.LEFT_KNEE, image_width, image_height)
-                    right_knee = get_landmark_coords(landmarks, mp_pose.PoseLandmark.RIGHT_KNEE, image_width, image_height)
-                    left_ankle = get_landmark_coords(landmarks, mp_pose.PoseLandmark.LEFT_ANKLE, image_width, image_height)
-                    right_ankle = get_landmark_coords(landmarks, mp_pose.PoseLandmark.RIGHT_ANKLE, image_width, image_height)
-                    
-                    # Calculate angles
-                    angles = {
-                        "left_elbow": int(calculate_angle(left_shoulder, left_elbow, left_wrist)),
-                        "right_elbow": int(calculate_angle(right_shoulder, right_elbow, right_wrist)),
-                        "left_knee": int(calculate_angle(left_hip, left_knee, left_ankle)),
-                        "right_knee": int(calculate_angle(right_hip, right_knee, right_ankle))
-                    }
-                    
-                    # Update workout counters
-                    if args.workout_type == 'PushUp' or args.workout_type == 'General':
-                        tracker.update_pushup_count(angles["left_elbow"], angles["right_elbow"])
-                    
-                    if args.workout_type == 'Squat' or args.workout_type == 'General':
-                        tracker.update_squat_count(angles["left_knee"], angles["right_knee"])
-                    
-                    # Draw custom skeleton
-                    draw_custom_skeleton(image, landmarks, mp_pose, image_width, image_height, line_color)
-                    
-                    # Draw MediaPipe pose landmarks
-                    mp_drawing.draw_landmarks(
-                        image,
-                        results.pose_landmarks,
-                        mp_pose.POSE_CONNECTIONS,
-                        drawing_spec,
-                        connection_drawing_spec=connection_spec
-                    )
-                    
-                    # Calculate FPS
-                    current_fps = 1.0 / (time.time() - frame_start_time) if (time.time() - frame_start_time) > 0 else 0
-                    
-                    # Draw info panel
-                    draw_info_panel(image, angles, tracker, current_fps)
-                    
-                else:
-                    # No pose detected
-                    cv2.putText(image, 'No pose detected', (50, 50), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-                    current_fps = 1.0 / (time.time() - frame_start_time) if (time.time() - frame_start_time) > 0 else 0
-                    cv2.putText(image, f'FPS: {int(current_fps)}', (10, 30), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            
-            except Exception as e:
-                print(f"Error processing frame: {e}")
-                current_fps = 1.0 / (time.time() - frame_start_time) if (time.time() - frame_start_time) > 0 else 0
-                cv2.putText(image, f'Processing Error - FPS: {int(current_fps)}', (10, 30), 
+            # Process results
+            if not paused and results.pose_landmarks:
+                landmarks = results.pose_landmarks.landmark
+                
+                # Get landmark coordinates
+                coords = {}
+                landmark_mapping = {
+                    'left_shoulder': mp_pose.PoseLandmark.LEFT_SHOULDER.value,
+                    'right_shoulder': mp_pose.PoseLandmark.RIGHT_SHOULDER.value,
+                    'left_elbow': mp_pose.PoseLandmark.LEFT_ELBOW.value,
+                    'right_elbow': mp_pose.PoseLandmark.RIGHT_ELBOW.value,
+                    'left_wrist': mp_pose.PoseLandmark.LEFT_WRIST.value,
+                    'right_wrist': mp_pose.PoseLandmark.RIGHT_WRIST.value,
+                    'left_hip': mp_pose.PoseLandmark.LEFT_HIP.value,
+                    'right_hip': mp_pose.PoseLandmark.RIGHT_HIP.value,
+                    'left_knee': mp_pose.PoseLandmark.LEFT_KNEE.value,
+                    'right_knee': mp_pose.PoseLandmark.RIGHT_KNEE.value,
+                    'left_ankle': mp_pose.PoseLandmark.LEFT_ANKLE.value,
+                    'right_ankle': mp_pose.PoseLandmark.RIGHT_ANKLE.value,
+                }
+                
+                for name, idx in landmark_mapping.items():
+                    coords[name] = get_landmark_coords(landmarks, idx, width, height)
+                
+                # Calculate angles
+                angles["left_elbow"] = calculate_angle(
+                    coords['left_shoulder'], coords['left_elbow'], coords['left_wrist'])
+                angles["right_elbow"] = calculate_angle(
+                    coords['right_shoulder'], coords['right_elbow'], coords['right_wrist'])
+                angles["left_knee"] = calculate_angle(
+                    coords['left_hip'], coords['left_knee'], coords['left_ankle'])
+                angles["right_knee"] = calculate_angle(
+                    coords['right_hip'], coords['right_knee'], coords['right_ankle'])
+                
+                # Update exercise counters
+                if args.workout_type in ['PushUp', 'General']:
+                    tracker.update_pushup_count(angles["left_elbow"], angles["right_elbow"])
+                
+                if args.workout_type in ['Squat', 'General']:
+                    tracker.update_squat_count(angles["left_knee"], angles["right_knee"])
+                
+                # Draw pose landmarks
+                draw_landmarks_and_connections(frame, results.pose_landmarks, mp_pose, mp_drawing)
+                
+                # Draw angle info on joints
+                draw_angle_info(frame, coords['left_elbow'], angles["left_elbow"], 'LE')
+                draw_angle_info(frame, coords['right_elbow'], angles["right_elbow"], 'RE')
+                draw_angle_info(frame, coords['left_knee'], angles["left_knee"], 'LK')
+                draw_angle_info(frame, coords['right_knee'], angles["right_knee"], 'RK')
+                
+            else:
+                # No pose detected
+                cv2.putText(frame, 'No pose detected', (50, 100), 
                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
             
-            # Write frame to output video
-            if out is not None:
-                out.write(image)
+            # Calculate FPS
+            processing_time = time.time() - start_time
+            current_fps = 1.0 / processing_time if processing_time > 0 else 0
+            
+            # Create info panel
+            create_info_panel(frame, angles, tracker, current_fps)
+            
+            # Add pause indicator
+            if paused:
+                cv2.putText(frame, 'PAUSED', (50, 50), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 255), 3)
+            
+            # Write output frame
+            if out is not None and not paused:
+                out.write(frame)
             
             # Display frame
-            display_scale = 0.8 if not args.cam else 1.0
-            display_frame = cv2.resize(image, (0, 0), fx=display_scale, fy=display_scale)
-            cv2.imshow('Fitness Tracker', display_frame)
+            cv2.imshow('Fitness Tracker', frame)
             
             # Handle keyboard input
             key = cv2.waitKey(1) & 0xFF
-            if key == 27 or key == ord('q'):  # ESC or 'q' to quit
+            if key == ord('q') or key == 27:  # Q or ESC
                 break
-            elif key == ord('r'):  # 'r' to reset counters
+            elif key == ord('r'):  # R for reset
                 tracker.reset_counters()
                 print("Counters reset!")
+            elif key == ord(' '):  # SPACE for pause
+                paused = not paused
+                print(f"{'Paused' if paused else 'Resumed'}")
     
     # Cleanup
-    vid.release()
-    if out is not None:
+    cap.release()
+    if out:
         out.release()
     cv2.destroyAllWindows()
     
-    # Print final results
-    print(f"\nFinal Results:")
-    print(f"Push-ups: {tracker.pushup_counter}")
-    print(f"Squats: {tracker.squat_counter}")
+    # Final results
+    print(f"\nSession Complete!")
+    print(f"Final Results:")
+    print(f"- Push-ups: {tracker.pushup_counter}")
+    print(f"- Squats: {tracker.squat_counter}")
 
 
 if __name__ == "__main__":
